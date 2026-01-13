@@ -26,3 +26,4 @@ htmlcov/
 
 # Logs
 *.log
+app.db
