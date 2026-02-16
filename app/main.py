@@ -10,7 +10,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional
 
+import httpx
 import redis.asyncio as redis
+import jwt
 from redis.exceptions import RedisError
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +39,11 @@ CIRCUIT_BREAKER_OPEN_SECONDS = int(os.getenv("CIRCUIT_BREAKER_OPEN_SECONDS", "45
 ENABLE_HSTS = os.getenv("ENABLE_HSTS", "false").lower() == "true"
 INTERNAL_GATEWAY_SECRET = os.getenv("INTERNAL_GATEWAY_SECRET")
 AUTH_SECRET = os.getenv("AUTH_SECRET")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_JWT_AUDIENCE = os.getenv("SUPABASE_JWT_AUDIENCE", "authenticated")
+SUPABASE_JWT_ISSUER = os.getenv("SUPABASE_JWT_ISSUER")
+SUPABASE_JWKS_CACHE_TTL_SECONDS = int(os.getenv("SUPABASE_JWKS_CACHE_TTL_SECONDS", "300"))
+SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS = float(os.getenv("SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS", "3"))
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or "development").lower()
 REDIS_URL = os.getenv("REDIS_URL")
 ENABLE_RATE_LIMITING = bool(REDIS_URL)
@@ -47,9 +54,18 @@ RATE_LIMITER_RETRY_SECONDS = float(os.getenv("RATE_LIMITER_RETRY_SECONDS", "15")
 RATE_LIMITER_WARNING_INTERVAL_SECONDS = float(os.getenv("RATE_LIMITER_WARNING_INTERVAL_SECONDS", "30"))
 LOCAL_RATE_LIMITER_MAX_BUCKETS = int(os.getenv("LOCAL_RATE_LIMITER_MAX_BUCKETS", "50000"))
 
-if not AUTH_SECRET and ENVIRONMENT != "production":
+if not SUPABASE_JWT_ISSUER and SUPABASE_URL:
+    SUPABASE_JWT_ISSUER = f"{SUPABASE_URL.rstrip('/')}/auth/v1"
+SUPABASE_JWKS_URL = (
+    f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else None
+)
+
+if not SUPABASE_URL and not AUTH_SECRET and ENVIRONMENT != "production":
     AUTH_SECRET = "dev-auth-secret-change-me"
-    logger.warning("AUTH_SECRET missing, using a development default. Do not use this in production.")
+    logger.warning(
+        "SUPABASE_URL and AUTH_SECRET are missing; using development AUTH_SECRET fallback. "
+        "Do not use this in production."
+    )
 
 def parse_limit(value: str, default_times: int, default_seconds: int) -> dict:
     raw = os.getenv(value)
@@ -99,9 +115,70 @@ def get_request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 
 
-def verify_bearer_token(token: str) -> Optional[str]:
+async def _fetch_jwks_by_kid() -> dict[str, dict]:
+    if not SUPABASE_JWKS_URL:
+        raise RuntimeError("Missing SUPABASE_JWKS_URL. Set SUPABASE_URL for JWT verification.")
+
+    async with httpx.AsyncClient(timeout=SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS) as client:
+        response = await client.get(SUPABASE_JWKS_URL)
+        response.raise_for_status()
+        payload = response.json()
+
+    keys = payload.get("keys")
+    if not isinstance(keys, list):
+        raise RuntimeError("Invalid JWKS payload from Supabase.")
+
+    parsed: dict[str, dict] = {}
+    for key in keys:
+        if not isinstance(key, dict):
+            continue
+        kid = key.get("kid")
+        if isinstance(kid, str) and kid:
+            parsed[kid] = key
+
+    if not parsed:
+        raise RuntimeError("Supabase JWKS payload did not include signing keys.")
+
+    return parsed
+
+
+jwks_cache_by_kid: dict[str, dict] = {}
+jwks_cache_expires_at = 0.0
+jwks_cache_lock: Optional[asyncio.Lock] = None
+
+
+async def _get_cached_jwk(kid: str) -> Optional[dict]:
+    global jwks_cache_by_kid, jwks_cache_expires_at, jwks_cache_lock
+
+    if not SUPABASE_JWKS_URL:
+        return None
+
+    now = time.monotonic()
+    if kid in jwks_cache_by_kid and now < jwks_cache_expires_at:
+        return jwks_cache_by_kid[kid]
+
+    if jwks_cache_lock is None:
+        jwks_cache_lock = asyncio.Lock()
+
+    async with jwks_cache_lock:
+        now = time.monotonic()
+        if kid in jwks_cache_by_kid and now < jwks_cache_expires_at:
+            return jwks_cache_by_kid[kid]
+        try:
+            jwks_cache_by_kid = await _fetch_jwks_by_kid()
+            jwks_cache_expires_at = time.monotonic() + SUPABASE_JWKS_CACHE_TTL_SECONDS
+        except Exception as exc:
+            logger.warning("supabase_jwks_fetch_failed error=%s", str(exc))
+            if kid in jwks_cache_by_kid:
+                return jwks_cache_by_kid[kid]
+            return None
+
+    return jwks_cache_by_kid.get(kid)
+
+
+def _verify_legacy_bearer_token(token: str) -> Optional[str]:
     if not AUTH_SECRET:
-        raise RuntimeError("Missing AUTH_SECRET. Set it to enable authenticated endpoints.")
+        return None
     if ":" not in token:
         return None
     user_id, signature = token.split(":", 1)
@@ -111,6 +188,51 @@ def verify_bearer_token(token: str) -> Optional[str]:
     if not hmac.compare_digest(signature, expected):
         return None
     return user_id
+
+
+async def verify_bearer_token(token: str) -> Optional[str]:
+    if SUPABASE_JWKS_URL and SUPABASE_JWT_ISSUER:
+        try:
+            headers = jwt.get_unverified_header(token)
+        except Exception:
+            return None
+
+        kid = headers.get("kid")
+        if not isinstance(kid, str) or not kid:
+            return None
+
+        jwk = await _get_cached_jwk(kid)
+        if not jwk:
+            return None
+
+        try:
+            public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+            if SUPABASE_JWT_AUDIENCE:
+                claims = jwt.decode(
+                    token,
+                    key=public_key,
+                    algorithms=["RS256"],
+                    audience=SUPABASE_JWT_AUDIENCE,
+                    issuer=SUPABASE_JWT_ISSUER,
+                    options={"require": ["sub", "exp"]},
+                )
+            else:
+                claims = jwt.decode(
+                    token,
+                    key=public_key,
+                    algorithms=["RS256"],
+                    issuer=SUPABASE_JWT_ISSUER,
+                    options={"verify_aud": False, "require": ["sub", "exp"]},
+                )
+        except jwt.InvalidTokenError:
+            return None
+
+        subject = claims.get("sub")
+        if isinstance(subject, str) and subject:
+            return subject
+        return None
+
+    return _verify_legacy_bearer_token(token)
 
 
 def sign_user_id(user_id: str) -> str:
@@ -334,8 +456,11 @@ async def lifespan(app: FastAPI):
         if ENVIRONMENT == "production":
             raise RuntimeError("Missing REDIS_URL. Set it to enable shared rate limiting.")
         logger.warning("REDIS_URL missing, rate limiting disabled in development.")
-    elif not AUTH_SECRET:
-        raise RuntimeError("Missing AUTH_SECRET. Set it to enable authenticated endpoints.")
+
+    if ENVIRONMENT == "production" and not SUPABASE_URL:
+        raise RuntimeError("Missing SUPABASE_URL. Set it to verify Supabase access tokens.")
+    if not SUPABASE_URL and AUTH_SECRET:
+        logger.warning("SUPABASE_URL missing; using legacy AUTH_SECRET bearer verification.")
 
     if ENABLE_RATE_LIMITING:
         initialized = await _initialize_rate_limiter(force=True)
@@ -426,7 +551,7 @@ async def request_context(request: Request, call_next):
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[len("Bearer ") :].strip()
-        user_id = verify_bearer_token(token)
+        user_id = await verify_bearer_token(token)
         if user_id:
             request.state.user_id = user_id
 
