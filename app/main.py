@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import List, Literal, Optional
 
 import redis.asyncio as redis
+from redis.exceptions import RedisError
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,6 +38,14 @@ ENABLE_HSTS = os.getenv("ENABLE_HSTS", "false").lower() == "true"
 INTERNAL_GATEWAY_SECRET = os.getenv("INTERNAL_GATEWAY_SECRET")
 AUTH_SECRET = os.getenv("AUTH_SECRET")
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or "development").lower()
+REDIS_URL = os.getenv("REDIS_URL")
+ENABLE_RATE_LIMITING = bool(REDIS_URL)
+REDIS_CONNECT_TIMEOUT_SECONDS = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.5"))
+REDIS_SOCKET_TIMEOUT_SECONDS = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "1.5"))
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
+RATE_LIMITER_RETRY_SECONDS = float(os.getenv("RATE_LIMITER_RETRY_SECONDS", "15"))
+RATE_LIMITER_WARNING_INTERVAL_SECONDS = float(os.getenv("RATE_LIMITER_WARNING_INTERVAL_SECONDS", "30"))
+LOCAL_RATE_LIMITER_MAX_BUCKETS = int(os.getenv("LOCAL_RATE_LIMITER_MAX_BUCKETS", "50000"))
 
 if not AUTH_SECRET and ENVIRONMENT != "production":
     AUTH_SECRET = "dev-auth-secret-change-me"
@@ -138,6 +147,162 @@ async def rate_limit_callback(request: Request, _response):
     return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
 
 
+rate_limiter_ready = False
+rate_limiter_next_retry_at = 0.0
+rate_limiter_last_warning_at = 0.0
+rate_limiter_init_lock: Optional[asyncio.Lock] = None
+rate_limiter_client: Optional[redis.Redis] = None
+# Emergency in-process limiter used when Redis is unavailable.
+local_rate_limiter_lock: Optional[asyncio.Lock] = None
+local_rate_limiter_hits: dict[str, List[float]] = {}
+
+
+def _rate_limiter_warning_allowed() -> bool:
+    global rate_limiter_last_warning_at
+    now = time.monotonic()
+    if now - rate_limiter_last_warning_at < RATE_LIMITER_WARNING_INTERVAL_SECONDS:
+        return False
+    rate_limiter_last_warning_at = now
+    return True
+
+
+def _build_local_rate_limit_key(request: Request, limits: dict) -> str:
+    actor = get_user_id(request) or get_client_ip(request)
+    return f"{request.url.path}|{actor}|{limits['times']}|{limits['seconds']}"
+
+
+def _prune_local_rate_limit_buckets(now: float) -> None:
+    stale_keys = []
+    for key, timestamps in local_rate_limiter_hits.items():
+        if not timestamps:
+            stale_keys.append(key)
+            continue
+        if now - timestamps[-1] > 3600:
+            stale_keys.append(key)
+    for key in stale_keys:
+        local_rate_limiter_hits.pop(key, None)
+
+
+async def _apply_local_rate_limit(request: Request, limits: dict) -> None:
+    global local_rate_limiter_lock
+    if local_rate_limiter_lock is None:
+        local_rate_limiter_lock = asyncio.Lock()
+
+    now = time.monotonic()
+    window_seconds = float(limits["seconds"])
+    max_hits = int(limits["times"])
+    key = _build_local_rate_limit_key(request, limits)
+
+    async with local_rate_limiter_lock:
+        cutoff = now - window_seconds
+        timestamps = [ts for ts in local_rate_limiter_hits.get(key, []) if ts > cutoff]
+
+        if len(timestamps) >= max_hits:
+            logger.warning(
+                "local_rate_limited path=%s user_id=%s ip=%s request_id=%s",
+                request.url.path,
+                get_user_id(request) or "-",
+                get_client_ip(request),
+                get_request_id(request),
+            )
+            raise HTTPException(status_code=429, detail="Too Many Requests")
+
+        timestamps.append(now)
+        local_rate_limiter_hits[key] = timestamps
+
+        if len(local_rate_limiter_hits) > LOCAL_RATE_LIMITER_MAX_BUCKETS:
+            _prune_local_rate_limit_buckets(now)
+
+
+def _build_redis_client(redis_url: str):
+    if redis_url.startswith("fakeredis://"):
+        from fakeredis.aioredis import FakeRedis
+
+        return FakeRedis(decode_responses=True)
+    return redis.from_url(
+        redis_url,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+    )
+
+
+async def _close_rate_limiter_client() -> None:
+    global rate_limiter_client
+    if rate_limiter_client is None:
+        return
+    try:
+        await rate_limiter_client.close()
+    except Exception:
+        logger.exception("rate_limiter_redis_close_failed")
+    finally:
+        rate_limiter_client = None
+
+
+async def _mark_rate_limiter_unavailable(
+    reason: str,
+    error: Exception,
+    request: Optional[Request] = None,
+) -> None:
+    global rate_limiter_ready, rate_limiter_next_retry_at
+    rate_limiter_ready = False
+    rate_limiter_next_retry_at = time.monotonic() + RATE_LIMITER_RETRY_SECONDS
+    await _close_rate_limiter_client()
+
+    if _rate_limiter_warning_allowed():
+        request_path = request.url.path if request else "-"
+        logger.warning(
+            "rate_limiter_unavailable reason=%s path=%s retry_in=%.1fs local_fallback=enabled error=%s",
+            reason,
+            request_path,
+            RATE_LIMITER_RETRY_SECONDS,
+            str(error),
+        )
+
+
+async def _initialize_rate_limiter(force: bool = False) -> bool:
+    global rate_limiter_ready, rate_limiter_next_retry_at, rate_limiter_init_lock, rate_limiter_client
+
+    if not ENABLE_RATE_LIMITING or not REDIS_URL:
+        return False
+
+    if rate_limiter_ready:
+        return True
+
+    now = time.monotonic()
+    if not force and now < rate_limiter_next_retry_at:
+        return False
+
+    if rate_limiter_init_lock is None:
+        rate_limiter_init_lock = asyncio.Lock()
+
+    async with rate_limiter_init_lock:
+        if rate_limiter_ready:
+            return True
+        now = time.monotonic()
+        if not force and now < rate_limiter_next_retry_at:
+            return False
+
+        try:
+            client = _build_redis_client(REDIS_URL)
+            await client.ping()
+            await FastAPILimiter.init(
+                client,
+                identifier=rate_limit_identifier,
+                http_callback=rate_limit_callback,
+            )
+            rate_limiter_client = client
+            rate_limiter_ready = True
+            rate_limiter_next_retry_at = 0.0
+            logger.info("rate_limiter_initialized")
+            return True
+        except Exception as exc:
+            await _mark_rate_limiter_unavailable("init_failed", exc)
+            return False
+
+
 class CircuitBreaker:
     def __init__(self, failures: int, open_seconds: int) -> None:
         self.failures = failures
@@ -165,43 +330,55 @@ odds_breaker = CircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    redis_url = os.getenv("REDIS_URL")
-
-    if not redis_url:
+    if not REDIS_URL:
         if ENVIRONMENT == "production":
             raise RuntimeError("Missing REDIS_URL. Set it to enable shared rate limiting.")
         logger.warning("REDIS_URL missing, rate limiting disabled in development.")
-        init_db()
-        yield
-        return
-
-    if not AUTH_SECRET:
+    elif not AUTH_SECRET:
         raise RuntimeError("Missing AUTH_SECRET. Set it to enable authenticated endpoints.")
 
-    if redis_url.startswith("fakeredis://"):
-        from fakeredis.aioredis import FakeRedis
-        redis_client = FakeRedis(decode_responses=True)
-    else:
-        redis_client = redis.from_url(redis_url, encoding="utf-8", decode_responses=True)
+    if ENABLE_RATE_LIMITING:
+        initialized = await _initialize_rate_limiter(force=True)
+        if not initialized and ENVIRONMENT == "production":
+            logger.error(
+                "rate_limiter_startup_failed: API is running fail-open and will retry Redis initialization."
+            )
 
-    await FastAPILimiter.init(
-        redis_client,
-        identifier=rate_limit_identifier,
-        http_callback=rate_limit_callback,
-    )
     init_db()
-    yield
-    await redis_client.close()
-
-
-
-ENABLE_RATE_LIMITING = bool(os.getenv("REDIS_URL"))
+    try:
+        yield
+    finally:
+        await _close_rate_limiter_client()
 
 def _noop_limiter():
     return None
 
 def limiter_dep(limits: dict):
-    return Depends(RateLimiter(**limits)) if ENABLE_RATE_LIMITING else Depends(_noop_limiter)
+    if not ENABLE_RATE_LIMITING:
+        return Depends(_noop_limiter)
+
+    limiter = RateLimiter(**limits)
+
+    async def _rate_limiter_dependency(request: Request, response: Response):
+        ready = await _initialize_rate_limiter()
+        if not ready:
+            await _apply_local_rate_limit(request, limits)
+            return None
+
+        try:
+            return await limiter(request, response)
+        except (RedisError, asyncio.TimeoutError, OSError) as exc:
+            await _mark_rate_limiter_unavailable("request_failed", exc, request=request)
+            await _apply_local_rate_limit(request, limits)
+            return None
+        except HTTPException:
+            raise
+        except Exception as exc:
+            await _mark_rate_limiter_unavailable("request_unexpected_error", exc, request=request)
+            await _apply_local_rate_limit(request, limits)
+            return None
+
+    return Depends(_rate_limiter_dependency)
 
 app = FastAPI(
     lifespan=lifespan,
