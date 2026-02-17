@@ -53,6 +53,7 @@ REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL
 RATE_LIMITER_RETRY_SECONDS = float(os.getenv("RATE_LIMITER_RETRY_SECONDS", "15"))
 RATE_LIMITER_WARNING_INTERVAL_SECONDS = float(os.getenv("RATE_LIMITER_WARNING_INTERVAL_SECONDS", "30"))
 LOCAL_RATE_LIMITER_MAX_BUCKETS = int(os.getenv("LOCAL_RATE_LIMITER_MAX_BUCKETS", "50000"))
+RATE_LIMITER_REQUEST_TIMEOUT_SECONDS = float(os.getenv("RATE_LIMITER_REQUEST_TIMEOUT_SECONDS", "2.5"))
 
 if not SUPABASE_JWT_ISSUER and SUPABASE_URL:
     SUPABASE_JWT_ISSUER = f"{SUPABASE_URL.rstrip('/')}/auth/v1"
@@ -491,8 +492,11 @@ def limiter_dep(limits: dict):
             return None
 
         try:
-            return await limiter(request, response)
-        except (RedisError, asyncio.TimeoutError, OSError) as exc:
+            return await asyncio.wait_for(
+                limiter(request, response),
+                timeout=RATE_LIMITER_REQUEST_TIMEOUT_SECONDS,
+            )
+        except (RedisError, asyncio.TimeoutError, TimeoutError, OSError) as exc:
             await _mark_rate_limiter_unavailable("request_failed", exc, request=request)
             await _apply_local_rate_limit(request, limits)
             return None
@@ -510,16 +514,31 @@ app = FastAPI(
     dependencies=[limiter_dep(LIMITS_DEFAULT)],
 )
 
+PRODUCTION_WEB_ORIGINS = [
+    "https://udfall.com",
+    "https://www.udfall.com",
+]
+DEVELOPMENT_WEB_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+if ENVIRONMENT == "production":
+    cors_allow_origins = PRODUCTION_WEB_ORIGINS.copy()
+else:
+    cors_allow_origins = PRODUCTION_WEB_ORIGINS + DEVELOPMENT_WEB_ORIGINS
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
+    allow_origins=cors_allow_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "X-Request-Id",
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    max_age=600,
 )
 
 
@@ -787,8 +806,16 @@ def health():
 
 
 @app.get("/markets", response_model=List[Market], dependencies=[limiter_dep(LIMITS_READ)])
-def list_markets():
-    return DEMO_MARKETS
+def list_markets(request: Request):
+    started_at = time.monotonic()
+    markets = DEMO_MARKETS
+    logger.info(
+        "markets_list_ok request_id=%s count=%s duration_ms=%s",
+        get_request_id(request),
+        len(markets),
+        int((time.monotonic() - started_at) * 1000),
+    )
+    return markets
 
 
 @app.get("/markets/{market_id}", response_model=Market, dependencies=[limiter_dep(LIMITS_READ)])
