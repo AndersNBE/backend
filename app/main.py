@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -10,7 +11,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional
 
-import httpx
 import redis.asyncio as redis
 import jwt
 from redis.exceptions import RedisError
@@ -60,6 +60,27 @@ if not SUPABASE_JWT_ISSUER and SUPABASE_URL:
 SUPABASE_JWKS_URL = (
     f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else None
 )
+SUPABASE_ALLOWED_ALGORITHMS = {"RS256", "ES256", "EdDSA"}
+
+
+def _build_supabase_jwk_client():
+    if not SUPABASE_JWKS_URL:
+        return None
+
+    kwargs = {}
+    try:
+        signature = inspect.signature(jwt.PyJWKClient.__init__)
+        if "lifespan" in signature.parameters:
+            kwargs["lifespan"] = SUPABASE_JWKS_CACHE_TTL_SECONDS
+        if "timeout" in signature.parameters:
+            kwargs["timeout"] = SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        kwargs = {}
+
+    return jwt.PyJWKClient(SUPABASE_JWKS_URL, **kwargs)
+
+
+SUPABASE_JWK_CLIENT = _build_supabase_jwk_client()
 
 if not SUPABASE_URL and not AUTH_SECRET and ENVIRONMENT != "production":
     AUTH_SECRET = "dev-auth-secret-change-me"
@@ -116,65 +137,9 @@ def get_request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 
 
-async def _fetch_jwks_by_kid() -> dict[str, dict]:
-    if not SUPABASE_JWKS_URL:
-        raise RuntimeError("Missing SUPABASE_JWKS_URL. Set SUPABASE_URL for JWT verification.")
-
-    async with httpx.AsyncClient(timeout=SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS) as client:
-        response = await client.get(SUPABASE_JWKS_URL)
-        response.raise_for_status()
-        payload = response.json()
-
-    keys = payload.get("keys")
-    if not isinstance(keys, list):
-        raise RuntimeError("Invalid JWKS payload from Supabase.")
-
-    parsed: dict[str, dict] = {}
-    for key in keys:
-        if not isinstance(key, dict):
-            continue
-        kid = key.get("kid")
-        if isinstance(kid, str) and kid:
-            parsed[kid] = key
-
-    if not parsed:
-        raise RuntimeError("Supabase JWKS payload did not include signing keys.")
-
-    return parsed
-
-
-jwks_cache_by_kid: dict[str, dict] = {}
-jwks_cache_expires_at = 0.0
-jwks_cache_lock: Optional[asyncio.Lock] = None
-
-
-async def _get_cached_jwk(kid: str) -> Optional[dict]:
-    global jwks_cache_by_kid, jwks_cache_expires_at, jwks_cache_lock
-
-    if not SUPABASE_JWKS_URL:
-        return None
-
-    now = time.monotonic()
-    if kid in jwks_cache_by_kid and now < jwks_cache_expires_at:
-        return jwks_cache_by_kid[kid]
-
-    if jwks_cache_lock is None:
-        jwks_cache_lock = asyncio.Lock()
-
-    async with jwks_cache_lock:
-        now = time.monotonic()
-        if kid in jwks_cache_by_kid and now < jwks_cache_expires_at:
-            return jwks_cache_by_kid[kid]
-        try:
-            jwks_cache_by_kid = await _fetch_jwks_by_kid()
-            jwks_cache_expires_at = time.monotonic() + SUPABASE_JWKS_CACHE_TTL_SECONDS
-        except Exception as exc:
-            logger.warning("supabase_jwks_fetch_failed error=%s", str(exc))
-            if kid in jwks_cache_by_kid:
-                return jwks_cache_by_kid[kid]
-            return None
-
-    return jwks_cache_by_kid.get(kid)
+def looks_like_jwt(token: str) -> bool:
+    parts = token.split(".")
+    return len(parts) == 3 and all(parts)
 
 
 def _verify_legacy_bearer_token(token: str) -> Optional[str]:
@@ -192,46 +157,37 @@ def _verify_legacy_bearer_token(token: str) -> Optional[str]:
 
 
 async def verify_bearer_token(token: str) -> Optional[str]:
-    if SUPABASE_JWKS_URL and SUPABASE_JWT_ISSUER:
-        try:
-            headers = jwt.get_unverified_header(token)
-        except Exception:
-            return None
+    if SUPABASE_JWK_CLIENT and SUPABASE_JWT_ISSUER:
+        headers = jwt.get_unverified_header(token)
+        algorithm = headers.get("alg")
+        if not isinstance(algorithm, str) or algorithm not in SUPABASE_ALLOWED_ALGORITHMS:
+            raise jwt.InvalidAlgorithmError("Unsupported JWT signing algorithm.")
+        signing_key = await asyncio.to_thread(SUPABASE_JWK_CLIENT.get_signing_key_from_jwt, token)
 
-        kid = headers.get("kid")
-        if not isinstance(kid, str) or not kid:
-            return None
-
-        jwk = await _get_cached_jwk(kid)
-        if not jwk:
-            return None
-
-        try:
-            public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+        def _decode_claims() -> dict:
             if SUPABASE_JWT_AUDIENCE:
-                claims = jwt.decode(
+                return jwt.decode(
                     token,
-                    key=public_key,
-                    algorithms=["RS256"],
+                    key=signing_key.key,
+                    algorithms=[algorithm],
                     audience=SUPABASE_JWT_AUDIENCE,
                     issuer=SUPABASE_JWT_ISSUER,
                     options={"require": ["sub", "exp"]},
                 )
-            else:
-                claims = jwt.decode(
-                    token,
-                    key=public_key,
-                    algorithms=["RS256"],
-                    issuer=SUPABASE_JWT_ISSUER,
-                    options={"verify_aud": False, "require": ["sub", "exp"]},
-                )
-        except jwt.InvalidTokenError:
-            return None
+            return jwt.decode(
+                token,
+                key=signing_key.key,
+                algorithms=[algorithm],
+                issuer=SUPABASE_JWT_ISSUER,
+                options={"verify_aud": False, "require": ["sub", "exp"]},
+            )
+
+        claims = await asyncio.to_thread(_decode_claims)
 
         subject = claims.get("sub")
         if isinstance(subject, str) and subject:
             return subject
-        return None
+        raise jwt.InvalidTokenError("JWT missing 'sub' claim.")
 
     return _verify_legacy_bearer_token(token)
 
@@ -557,6 +513,7 @@ def apply_security_headers(response: Response, request_id: str, is_secure: bool)
 async def request_context(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     request.state.request_id = request_id
+    request.state.user_id = None
 
     if request.headers.get("x-user-id") and request.url.path in PROTECTED_PATHS:
         internal_auth = request.headers.get("x-internal-auth")
@@ -570,9 +527,19 @@ async def request_context(request: Request, call_next):
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[len("Bearer ") :].strip()
-        user_id = await verify_bearer_token(token)
-        if user_id:
-            request.state.user_id = user_id
+        if looks_like_jwt(token):
+            try:
+                user_id = await verify_bearer_token(token)
+            except Exception as exc:
+                logger.info(
+                    "auth_token_invalid path=%s request_id=%s error_type=%s",
+                    request.url.path,
+                    request_id,
+                    exc.__class__.__name__,
+                )
+                user_id = None
+            if user_id:
+                request.state.user_id = user_id
 
     response = await call_next(request)
     return apply_security_headers(response, request_id, request.url.scheme == "https")
