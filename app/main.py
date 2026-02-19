@@ -24,7 +24,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .storage import BetRecord, IdempotencyRecord, SessionLocal, init_db
+from .routers.trading import router as trading_router
+from .storage import (
+    BetRecord,
+    IdempotencyRecord,
+    TradingMarket,
+    TradingMarketStatus,
+    get_db,
+    init_db,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
@@ -496,6 +504,7 @@ app.add_middleware(
     ],
     max_age=600,
 )
+app.include_router(trading_router)
 
 
 def apply_security_headers(response: Response, request_id: str, is_secure: bool) -> Response:
@@ -587,16 +596,6 @@ async def request_size_guard(request: Request, call_next):
             return JSONResponse(status_code=413, content={"detail": "Payload Too Large"})
         request._body = body
     return await call_next(request)
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
 Category = Literal["politics", "sports", "finance", "entertainment"]
 Status = Literal["open", "closed", "settled"]
 
@@ -638,133 +637,69 @@ class PayoutRequest(BaseModel):
     amount_dkk: int = Field(..., ge=1)
 
 
-DEMO_MARKETS: List[Market] = [
-    Market(
-        id="novo_1000",
-        title="Vil Novo Nordisk aktien overstige 1000 DKK?",
-        status="settled",
-        yesPrice=0.52,
-        noPrice=0.48,
-        category="finance",
-        volumeKr=5_700_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="vingegaard_tdf_2025",
-        title="Vil Jonas Vingegaard vinde Tour de France 2025?",
-        status="settled",
-        yesPrice=0.38,
-        noPrice=0.62,
-        category="sports",
-        volumeKr=4_100_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="dk_vm_2026",
-        title="Vil Danmark kvalificere sig til VM 2026?",
-        status="settled",
-        yesPrice=0.82,
-        noPrice=0.18,
-        category="sports",
-        volumeKr=3_500_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="fck_superliga_2425",
-        title="Vil FC Koebenhavn vinde Superligaen 2024/25?",
-        status="settled",
-        yesPrice=0.45,
-        noPrice=0.55,
-        category="sports",
-        volumeKr=2_300_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="c25_3000_2025",
-        title="Vil C25 indekset naa 3000 point i 2025?",
-        status="settled",
-        yesPrice=0.48,
-        noPrice=0.52,
-        category="finance",
-        volumeKr=2_300_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="dk_eurovision_2025",
-        title="Vil Danmark vinde Eurovision 2025?",
-        status="settled",
-        yesPrice=0.12,
-        noPrice=0.88,
-        category="entertainment",
-        volumeKr=2_300_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="dk_handbold_vm_2025",
-        title="Vil det danske haandboldlandshold vinde VM 2025?",
-        status="settled",
-        yesPrice=0.28,
-        noPrice=0.72,
-        category="sports",
-        volumeKr=1_900_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="vestas_20_2025",
-        title="Vil Vestas aktien stige 20% i 2025?",
-        status="settled",
-        yesPrice=0.35,
-        noPrice=0.65,
-        category="finance",
-        volumeKr=1_900_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="mf_statsminister_2025",
-        title="Vil Mette Frederiksen forblive statsminister hele 2025?",
-        status="settled",
-        yesPrice=0.75,
-        noPrice=0.25,
-        category="politics",
-        volumeKr=1_600_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="maersk_15000_2025",
-        title="Vil Maersk aktien vaere over 15.000 DKK ved aarets udgang?",
-        status="settled",
-        yesPrice=0.41,
-        noPrice=0.59,
-        category="finance",
-        volumeKr=1_400_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="s_vinder_valg",
-        title="Vil Socialdemokratiet vinde naeste folketingsvalg?",
-        status="settled",
-        yesPrice=0.44,
-        noPrice=0.56,
-        category="politics",
-        volumeKr=1_300_000,
-        description="Demo market for UI wiring",
-    ),
-    Market(
-        id="dk_saenke_skat_2025",
-        title="Vil Danmark saenke skatten i 2025?",
-        status="settled",
-        yesPrice=0.31,
-        noPrice=0.69,
-        category="politics",
-        volumeKr=1_200_000,
-        description="Demo market for UI wiring",
-    ),
-]
+TRADING_TO_LEGACY_STATUS: dict[str, Status] = {
+    TradingMarketStatus.draft.value: "open",
+    TradingMarketStatus.review.value: "open",
+    TradingMarketStatus.scheduled.value: "open",
+    TradingMarketStatus.live.value: "open",
+    TradingMarketStatus.trading_paused.value: "open",
+    TradingMarketStatus.closed.value: "closed",
+    TradingMarketStatus.resolving.value: "closed",
+    TradingMarketStatus.settled.value: "settled",
+    TradingMarketStatus.cancelled.value: "closed",
+}
+
+
+def _enum_value(raw: object) -> str:
+    value = getattr(raw, "value", None)
+    if isinstance(value, str):
+        return value
+    return str(raw)
+
+
+def _market_category(raw: object) -> Category:
+    category = _enum_value(raw)
+    if category in {"politics", "sports", "finance", "entertainment"}:
+        return category  # type: ignore[return-value]
+    return "finance"
+
+
+def _market_status(raw: object) -> Status:
+    return TRADING_TO_LEGACY_STATUS.get(_enum_value(raw), "open")
+
+
+def to_market_response(market: TradingMarket) -> Market:
+    yes_price_bps = int(market.yes_price_bps)
+    no_price_bps = int(getattr(market, "no_price_bps", 10000 - yes_price_bps))
+    return Market(
+        id=market.slug,
+        title=market.title,
+        status=_market_status(market.status),
+        yesPrice=max(0, min(1, yes_price_bps / 10000)),
+        noPrice=max(0, min(1, no_price_bps / 10000)),
+        category=_market_category(market.category),
+        volumeKr=0,
+        description=market.description,
+    )
+
+
+def fetch_market_by_slug(db: Session, market_slug: str) -> Optional[TradingMarket]:
+    return (
+        db.query(TradingMarket)
+        .filter(TradingMarket.slug == market_slug)
+        .one_or_none()
+    )
 
 
 @app.get("/", dependencies=[limiter_dep(LIMITS_READ)])
 def root():
-    return {"message": "Backend is running", "docs": "/docs", "health": "/health", "markets": "/markets"}
+    return {
+        "message": "Backend is running",
+        "docs": "/docs",
+        "health": "/health",
+        "markets": "/markets",
+        "trading_markets": "/trading/markets",
+    }
 
 
 @app.get("/health", dependencies=[limiter_dep(LIMITS_READ)])
@@ -773,9 +708,14 @@ def health():
 
 
 @app.get("/markets", response_model=List[Market], dependencies=[limiter_dep(LIMITS_READ)])
-def list_markets(request: Request):
+def list_markets(request: Request, db: Session = Depends(get_db)):
     started_at = time.monotonic()
-    markets = DEMO_MARKETS
+    rows = (
+        db.query(TradingMarket)
+        .order_by(TradingMarket.created_at.desc())
+        .all()
+    )
+    markets = [to_market_response(row) for row in rows]
     logger.info(
         "markets_list_ok request_id=%s count=%s duration_ms=%s",
         get_request_id(request),
@@ -786,10 +726,10 @@ def list_markets(request: Request):
 
 
 @app.get("/markets/{market_id}", response_model=Market, dependencies=[limiter_dep(LIMITS_READ)])
-def get_market(market_id: str):
-    for market in DEMO_MARKETS:
-        if market.id == market_id:
-            return market
+def get_market(market_id: str, db: Session = Depends(get_db)):
+    market = fetch_market_by_slug(db, market_id)
+    if market is not None:
+        return to_market_response(market)
     raise HTTPException(status_code=404, detail="Market not found")
 
 
@@ -831,25 +771,28 @@ async def fetch_quote_for_market(market: Market) -> dict:
 
 
 @app.get("/odds/quote", dependencies=[limiter_dep(LIMITS_AUTH)])
-async def odds_quote(market_id: str):
-    for market in DEMO_MARKETS:
-        if market.id == market_id:
-            if not odds_breaker.allow():
-                raise HTTPException(status_code=503, detail="Odds service temporarily unavailable")
-            try:
-                response = await asyncio.wait_for(
-                    fetch_quote_for_market(market),
-                    timeout=EXTERNAL_REQUEST_TIMEOUT_SECONDS,
-                )
-                odds_breaker.record_success()
-                return response
-            except asyncio.TimeoutError as exc:
-                odds_breaker.record_failure()
-                raise HTTPException(status_code=504, detail="Upstream timeout") from exc
-            except Exception as exc:
-                odds_breaker.record_failure()
-                raise HTTPException(status_code=503, detail="Odds service error") from exc
-    raise HTTPException(status_code=404, detail="Market not found")
+async def odds_quote(market_id: str, db: Session = Depends(get_db)):
+    market_row = fetch_market_by_slug(db, market_id)
+    if market_row is None:
+        raise HTTPException(status_code=404, detail="Market not found")
+
+    market = to_market_response(market_row)
+    if not odds_breaker.allow():
+        raise HTTPException(status_code=503, detail="Odds service temporarily unavailable")
+
+    try:
+        response = await asyncio.wait_for(
+            fetch_quote_for_market(market),
+            timeout=EXTERNAL_REQUEST_TIMEOUT_SECONDS,
+        )
+        odds_breaker.record_success()
+        return response
+    except asyncio.TimeoutError as exc:
+        odds_breaker.record_failure()
+        raise HTTPException(status_code=504, detail="Upstream timeout") from exc
+    except Exception as exc:
+        odds_breaker.record_failure()
+        raise HTTPException(status_code=503, detail="Odds service error") from exc
 
 
 def fetch_idempotency_record(
@@ -978,7 +921,7 @@ def place_bet(
         raise HTTPException(status_code=409, detail="Request in progress")
 
     try:
-        if not any(market.id == payload.market_id for market in DEMO_MARKETS):
+        if fetch_market_by_slug(db, payload.market_id) is None:
             response_body = {"detail": "Market not found"}
             store_idempotency_response(db, record, status.HTTP_404_NOT_FOUND, response_body)
             audit_logger.warning(
