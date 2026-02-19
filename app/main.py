@@ -70,6 +70,7 @@ RATE_LIMITER_STARTUP_WAIT_SECONDS = float(os.getenv("RATE_LIMITER_STARTUP_WAIT_S
 RATE_LIMITER_FAIL_CLOSED = os.getenv("RATE_LIMITER_FAIL_CLOSED", "false").lower() == "true"
 REDIS_SSL_CERT_REQS = os.getenv("REDIS_SSL_CERT_REQS", "required").lower()
 REDIS_FORCE_TLS = os.getenv("REDIS_FORCE_TLS", "false").lower() == "true"
+REDIS_TRY_TLS_FALLBACK = os.getenv("REDIS_TRY_TLS_FALLBACK", "true").lower() == "true"
 
 if not SUPABASE_JWT_ISSUER and SUPABASE_URL:
     SUPABASE_JWT_ISSUER = f"{SUPABASE_URL.rstrip('/')}/auth/v1"
@@ -249,6 +250,7 @@ rate_limiter_init_lock: Optional[asyncio.Lock] = None
 rate_limiter_client: Optional[redis.Redis] = None
 rate_limiter_retry_task: Optional[asyncio.Task] = None
 rate_limiter_retry_stop_event: Optional[asyncio.Event] = None
+rate_limiter_active_url: Optional[str] = None
 # Emergency in-process limiter used when Redis is unavailable.
 local_rate_limiter_lock: Optional[asyncio.Lock] = None
 local_rate_limiter_hits: dict[str, List[float]] = {}
@@ -274,6 +276,14 @@ def _redis_endpoint_for_logs(redis_url: str) -> str:
         return f"{parsed.scheme}://{parsed.hostname or '-'}:{parsed.port or '-'}"
     except Exception:
         return "<invalid-redis-url>"
+
+
+def _rate_limiter_log_url() -> str:
+    if rate_limiter_active_url:
+        return _redis_endpoint_for_logs(rate_limiter_active_url)
+    if REDIS_URL:
+        return _redis_endpoint_for_logs(REDIS_URL)
+    return "-"
 
 
 def _redis_ssl_cert_reqs_mode() -> int:
@@ -331,6 +341,31 @@ def _normalize_redis_url(redis_url: str) -> str:
         parsed = parsed._replace(query=urlencode(filtered_pairs, doseq=True))
 
     return urlunparse(parsed)
+
+
+def _redis_candidate_urls(redis_url: str) -> list[str]:
+    normalized = _normalize_redis_url(redis_url)
+    parsed = urlparse(normalized)
+    scheme = parsed.scheme.lower()
+
+    candidates = [normalized]
+    if not REDIS_TRY_TLS_FALLBACK:
+        return candidates
+
+    if scheme == "redis":
+        candidates.append(urlunparse(parsed._replace(scheme="rediss")))
+    elif scheme == "rediss" and not REDIS_FORCE_TLS:
+        candidates.append(urlunparse(parsed._replace(scheme="redis")))
+
+    # Deduplicate while preserving order.
+    deduped: list[str] = []
+    seen = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        deduped.append(item)
+        seen.add(item)
+    return deduped
 
 
 def _prune_local_rate_limit_buckets(now: float) -> None:
@@ -419,9 +454,10 @@ async def _close_redis_client_instance(client: Optional[redis.Redis], reason: st
 
 
 async def _close_rate_limiter_client() -> None:
-    global rate_limiter_client
+    global rate_limiter_active_url, rate_limiter_client
     client = rate_limiter_client
     rate_limiter_client = None
+    rate_limiter_active_url = None
     await _close_redis_client_instance(client, reason="global_close")
 
 
@@ -438,18 +474,19 @@ async def _mark_rate_limiter_unavailable(
     if _rate_limiter_warning_allowed():
         request_path = request.url.path if request else "-"
         logger.warning(
-            "rate_limiter_unavailable reason=%s path=%s redis=%s retry_in=%.1fs local_fallback=enabled error_type=%s error=%s",
+            "rate_limiter_unavailable reason=%s path=%s redis=%s retry_in=%.1fs local_fallback=enabled error_type=%s error=%s error_repr=%r",
             reason,
             request_path,
-            _redis_endpoint_for_logs(REDIS_URL) if REDIS_URL else "-",
+            _rate_limiter_log_url(),
             RATE_LIMITER_RETRY_SECONDS,
             error.__class__.__name__,
             str(error),
+            error,
         )
 
 
 async def _initialize_rate_limiter(force: bool = False) -> bool:
-    global rate_limiter_ready, rate_limiter_next_retry_at, rate_limiter_init_lock, rate_limiter_client
+    global rate_limiter_active_url, rate_limiter_ready, rate_limiter_next_retry_at, rate_limiter_init_lock, rate_limiter_client
 
     if not ENABLE_RATE_LIMITING or not REDIS_URL:
         return False
@@ -471,30 +508,42 @@ async def _initialize_rate_limiter(force: bool = False) -> bool:
         if not force and now < rate_limiter_next_retry_at:
             return False
 
-        client: Optional[redis.Redis] = None
-        try:
-            client = _build_redis_client(REDIS_URL)
-            await asyncio.wait_for(client.ping(), timeout=REDIS_INIT_TIMEOUT_SECONDS)
-            await asyncio.wait_for(
-                FastAPILimiter.init(
-                    client,
-                    identifier=rate_limit_identifier,
-                    http_callback=rate_limit_callback,
-                ),
-                timeout=REDIS_INIT_TIMEOUT_SECONDS,
-            )
-            rate_limiter_client = client
-            rate_limiter_ready = True
-            rate_limiter_next_retry_at = 0.0
-            logger.info(
-                "rate_limiter_initialized redis=%s",
-                _redis_endpoint_for_logs(REDIS_URL),
-            )
-            return True
-        except Exception as exc:
-            await _close_redis_client_instance(client, reason="init_failed")
-            await _mark_rate_limiter_unavailable("init_failed", exc)
-            return False
+        last_error: Optional[Exception] = None
+        for candidate_url in _redis_candidate_urls(REDIS_URL):
+            client: Optional[redis.Redis] = None
+            try:
+                client = _build_redis_client(candidate_url)
+                await asyncio.wait_for(client.ping(), timeout=REDIS_INIT_TIMEOUT_SECONDS)
+                await asyncio.wait_for(
+                    FastAPILimiter.init(
+                        client,
+                        identifier=rate_limit_identifier,
+                        http_callback=rate_limit_callback,
+                    ),
+                    timeout=REDIS_INIT_TIMEOUT_SECONDS,
+                )
+                rate_limiter_client = client
+                rate_limiter_active_url = candidate_url
+                rate_limiter_ready = True
+                rate_limiter_next_retry_at = 0.0
+                logger.info(
+                    "rate_limiter_initialized redis=%s",
+                    _redis_endpoint_for_logs(candidate_url),
+                )
+                return True
+            except Exception as exc:
+                last_error = exc
+                await _close_redis_client_instance(client, reason="candidate_init_failed")
+                logger.warning(
+                    "rate_limiter_candidate_failed redis=%s error_type=%s error=%s",
+                    _redis_endpoint_for_logs(candidate_url),
+                    exc.__class__.__name__,
+                    str(exc),
+                )
+                continue
+
+        await _mark_rate_limiter_unavailable("init_failed", last_error or RuntimeError("unknown"))
+        return False
 
 
 async def _rate_limiter_retry_loop() -> None:
@@ -914,7 +963,7 @@ def health():
             "enabled": ENABLE_RATE_LIMITING,
             "ready": rate_limiter_ready,
             "degraded": bool(ENABLE_RATE_LIMITING and not rate_limiter_ready),
-            "redis": _redis_endpoint_for_logs(REDIS_URL) if REDIS_URL else None,
+            "redis": _rate_limiter_log_url() if REDIS_URL else None,
         },
     }
 

@@ -20,6 +20,7 @@ Optional Redis/rate limiter tuning:
 - `RATE_LIMITER_FAIL_CLOSED=false` (set `true` to fail startup if Redis is unavailable)
 - `REDIS_SSL_CERT_REQS=required` (`none`, `optional`, `required`)
 - `REDIS_FORCE_TLS=false` (set `true` to force `redis://` URLs to connect as TLS)
+- `REDIS_TRY_TLS_FALLBACK=true` (tries `rediss://` automatically if `redis://` fails)
 
 ## Trading API source of truth
 
