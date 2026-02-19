@@ -368,8 +368,6 @@ def _build_redis_client(redis_url: str):
     if scheme == "rediss":
         client_kwargs["ssl"] = True
         client_kwargs["ssl_cert_reqs"] = _redis_ssl_cert_reqs_mode()
-    else:
-        client_kwargs["ssl"] = False
 
     return redis.from_url(normalized_url, **client_kwargs)
 
