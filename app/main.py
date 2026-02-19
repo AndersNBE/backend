@@ -11,7 +11,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import redis.asyncio as redis
 import jwt
@@ -299,6 +299,36 @@ def _normalize_redis_url(redis_url: str) -> str:
 
     if REDIS_FORCE_TLS and scheme == "redis":
         parsed = parsed._replace(scheme="rediss")
+        scheme = "rediss"
+
+    ssl_keys = {
+        "ssl",
+        "ssl_cert_reqs",
+        "ssl_check_hostname",
+        "ssl_ca_certs",
+        "ssl_ca_data",
+        "ssl_keyfile",
+        "ssl_certfile",
+        "ssl_password",
+        "ssl_validate_ocsp",
+        "ssl_validate_ocsp_stapled",
+        "ssl_min_version",
+        "ssl_ciphers",
+    }
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+
+    if scheme == "redis":
+        filtered_pairs = [(k, v) for (k, v) in query_pairs if k.lower() not in ssl_keys]
+        if len(filtered_pairs) != len(query_pairs):
+            logger.warning(
+                "redis_url_sanitized scheme=redis removed_ssl_query_params=1 host=%s",
+                parsed.hostname or "-",
+            )
+        parsed = parsed._replace(query=urlencode(filtered_pairs, doseq=True))
+    elif scheme == "rediss":
+        # `rediss://` already implies TLS. Remove explicit `ssl` query key if present.
+        filtered_pairs = [(k, v) for (k, v) in query_pairs if k.lower() != "ssl"]
+        parsed = parsed._replace(query=urlencode(filtered_pairs, doseq=True))
 
     return urlunparse(parsed)
 
