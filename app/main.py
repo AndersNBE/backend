@@ -5,7 +5,6 @@ import inspect
 import json
 import logging
 import os
-import ssl
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -286,17 +285,12 @@ def _rate_limiter_log_url() -> str:
     return "-"
 
 
-def _redis_ssl_cert_reqs_mode() -> int:
-    mapping = {
-        "none": ssl.CERT_NONE,
-        "optional": ssl.CERT_OPTIONAL,
-        "required": ssl.CERT_REQUIRED,
-    }
-    if REDIS_SSL_CERT_REQS not in mapping:
+def _validate_redis_ssl_cert_reqs_value() -> None:
+    allowed = {"none", "optional", "required"}
+    if REDIS_SSL_CERT_REQS not in allowed:
         raise ValueError(
             f"Invalid REDIS_SSL_CERT_REQS='{REDIS_SSL_CERT_REQS}'. Use one of: none, optional, required."
         )
-    return mapping[REDIS_SSL_CERT_REQS]
 
 
 def _normalize_redis_url(redis_url: str) -> str:
@@ -338,6 +332,10 @@ def _normalize_redis_url(redis_url: str) -> str:
     elif scheme == "rediss":
         # `rediss://` already implies TLS. Remove explicit `ssl` query key if present.
         filtered_pairs = [(k, v) for (k, v) in query_pairs if k.lower() != "ssl"]
+        has_ssl_cert_reqs = any(k.lower() == "ssl_cert_reqs" for (k, _v) in filtered_pairs)
+        if not has_ssl_cert_reqs:
+            _validate_redis_ssl_cert_reqs_value()
+            filtered_pairs.append(("ssl_cert_reqs", REDIS_SSL_CERT_REQS))
         parsed = parsed._replace(query=urlencode(filtered_pairs, doseq=True))
 
     return urlunparse(parsed)
@@ -430,9 +428,6 @@ def _build_redis_client(redis_url: str):
         "retry_on_timeout": True,
         "socket_keepalive": True,
     }
-    if scheme == "rediss":
-        client_kwargs["ssl"] = True
-        client_kwargs["ssl_cert_reqs"] = _redis_ssl_cert_reqs_mode()
 
     return redis.from_url(normalized_url, **client_kwargs)
 
