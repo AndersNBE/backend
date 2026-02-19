@@ -4,13 +4,22 @@
 
 - `ENVIRONMENT=production`
 - `DATABASE_URL=<Supabase Postgres connection string>`
-- `REDIS_URL=<Railway Redis URL>`
 - `SUPABASE_URL=https://<project-ref>.supabase.co`
 - `SUPABASE_JWT_ISSUER=https://<project-ref>.supabase.co/auth/v1`
 - `SUPABASE_JWT_AUDIENCE=authenticated`
+- `REDIS_URL=redis://...` or `rediss://...` (Railway Redis endpoint)
 
 `DATABASE_URL` must be PostgreSQL. Startup now fails if it is missing.
 SSL is enforced by appending `sslmode=require` if it is not already present.
+
+Optional Redis/rate limiter tuning:
+
+- `REDIS_INIT_TIMEOUT_SECONDS=2.5`
+- `RATE_LIMITER_RETRY_LOOP_SECONDS=10`
+- `RATE_LIMITER_STARTUP_WAIT_SECONDS=0.25`
+- `RATE_LIMITER_FAIL_CLOSED=false` (set `true` to fail startup if Redis is unavailable)
+- `REDIS_SSL_CERT_REQS=required` (`none`, `optional`, `required`)
+- `REDIS_FORCE_TLS=false` (set `true` to force `redis://` URLs to connect as TLS)
 
 ## Trading API source of truth
 

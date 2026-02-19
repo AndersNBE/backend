@@ -5,11 +5,13 @@ import inspect
 import json
 import logging
 import os
+import ssl
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional
+from urllib.parse import urlparse, urlunparse
 
 import redis.asyncio as redis
 import jwt
@@ -62,6 +64,12 @@ RATE_LIMITER_RETRY_SECONDS = float(os.getenv("RATE_LIMITER_RETRY_SECONDS", "15")
 RATE_LIMITER_WARNING_INTERVAL_SECONDS = float(os.getenv("RATE_LIMITER_WARNING_INTERVAL_SECONDS", "30"))
 LOCAL_RATE_LIMITER_MAX_BUCKETS = int(os.getenv("LOCAL_RATE_LIMITER_MAX_BUCKETS", "50000"))
 RATE_LIMITER_REQUEST_TIMEOUT_SECONDS = float(os.getenv("RATE_LIMITER_REQUEST_TIMEOUT_SECONDS", "2.5"))
+REDIS_INIT_TIMEOUT_SECONDS = float(os.getenv("REDIS_INIT_TIMEOUT_SECONDS", "2.5"))
+RATE_LIMITER_RETRY_LOOP_SECONDS = float(os.getenv("RATE_LIMITER_RETRY_LOOP_SECONDS", "10"))
+RATE_LIMITER_STARTUP_WAIT_SECONDS = float(os.getenv("RATE_LIMITER_STARTUP_WAIT_SECONDS", "0.25"))
+RATE_LIMITER_FAIL_CLOSED = os.getenv("RATE_LIMITER_FAIL_CLOSED", "false").lower() == "true"
+REDIS_SSL_CERT_REQS = os.getenv("REDIS_SSL_CERT_REQS", "required").lower()
+REDIS_FORCE_TLS = os.getenv("REDIS_FORCE_TLS", "false").lower() == "true"
 
 if not SUPABASE_JWT_ISSUER and SUPABASE_URL:
     SUPABASE_JWT_ISSUER = f"{SUPABASE_URL.rstrip('/')}/auth/v1"
@@ -239,6 +247,8 @@ rate_limiter_next_retry_at = 0.0
 rate_limiter_last_warning_at = 0.0
 rate_limiter_init_lock: Optional[asyncio.Lock] = None
 rate_limiter_client: Optional[redis.Redis] = None
+rate_limiter_retry_task: Optional[asyncio.Task] = None
+rate_limiter_retry_stop_event: Optional[asyncio.Event] = None
 # Emergency in-process limiter used when Redis is unavailable.
 local_rate_limiter_lock: Optional[asyncio.Lock] = None
 local_rate_limiter_hits: dict[str, List[float]] = {}
@@ -256,6 +266,41 @@ def _rate_limiter_warning_allowed() -> bool:
 def _build_local_rate_limit_key(request: Request, limits: dict) -> str:
     actor = get_user_id(request) or get_client_ip(request)
     return f"{request.url.path}|{actor}|{limits['times']}|{limits['seconds']}"
+
+
+def _redis_endpoint_for_logs(redis_url: str) -> str:
+    try:
+        parsed = urlparse(redis_url)
+        return f"{parsed.scheme}://{parsed.hostname or '-'}:{parsed.port or '-'}"
+    except Exception:
+        return "<invalid-redis-url>"
+
+
+def _redis_ssl_cert_reqs_mode() -> int:
+    mapping = {
+        "none": ssl.CERT_NONE,
+        "optional": ssl.CERT_OPTIONAL,
+        "required": ssl.CERT_REQUIRED,
+    }
+    if REDIS_SSL_CERT_REQS not in mapping:
+        raise ValueError(
+            f"Invalid REDIS_SSL_CERT_REQS='{REDIS_SSL_CERT_REQS}'. Use one of: none, optional, required."
+        )
+    return mapping[REDIS_SSL_CERT_REQS]
+
+
+def _normalize_redis_url(redis_url: str) -> str:
+    parsed = urlparse(redis_url.strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"redis", "rediss", "fakeredis"}:
+        raise ValueError(
+            f"Unsupported Redis URL scheme '{parsed.scheme}'. Use redis:// or rediss://."
+        )
+
+    if REDIS_FORCE_TLS and scheme == "redis":
+        parsed = parsed._replace(scheme="rediss")
+
+    return urlunparse(parsed)
 
 
 def _prune_local_rate_limit_buckets(now: float) -> None:
@@ -302,30 +347,54 @@ async def _apply_local_rate_limit(request: Request, limits: dict) -> None:
 
 
 def _build_redis_client(redis_url: str):
-    if redis_url.startswith("fakeredis://"):
+    normalized_url = _normalize_redis_url(redis_url)
+    parsed = urlparse(normalized_url)
+    scheme = parsed.scheme.lower()
+
+    if scheme == "fakeredis":
         from fakeredis.aioredis import FakeRedis
 
         return FakeRedis(decode_responses=True)
-    return redis.from_url(
-        redis_url,
-        encoding="utf-8",
-        decode_responses=True,
-        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
-        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
-    )
+
+    client_kwargs = {
+        "encoding": "utf-8",
+        "decode_responses": True,
+        "socket_connect_timeout": REDIS_CONNECT_TIMEOUT_SECONDS,
+        "socket_timeout": REDIS_SOCKET_TIMEOUT_SECONDS,
+        "health_check_interval": REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+        "retry_on_timeout": True,
+        "socket_keepalive": True,
+    }
+    if scheme == "rediss":
+        client_kwargs["ssl"] = True
+        client_kwargs["ssl_cert_reqs"] = _redis_ssl_cert_reqs_mode()
+    else:
+        client_kwargs["ssl"] = False
+
+    return redis.from_url(normalized_url, **client_kwargs)
+
+
+async def _close_redis_client_instance(client: Optional[redis.Redis], reason: str) -> None:
+    if client is None:
+        return
+
+    close_method = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close_method is None:
+        return
+
+    try:
+        result = close_method()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception("rate_limiter_redis_close_failed reason=%s", reason)
 
 
 async def _close_rate_limiter_client() -> None:
     global rate_limiter_client
-    if rate_limiter_client is None:
-        return
-    try:
-        await rate_limiter_client.close()
-    except Exception:
-        logger.exception("rate_limiter_redis_close_failed")
-    finally:
-        rate_limiter_client = None
+    client = rate_limiter_client
+    rate_limiter_client = None
+    await _close_redis_client_instance(client, reason="global_close")
 
 
 async def _mark_rate_limiter_unavailable(
@@ -341,10 +410,12 @@ async def _mark_rate_limiter_unavailable(
     if _rate_limiter_warning_allowed():
         request_path = request.url.path if request else "-"
         logger.warning(
-            "rate_limiter_unavailable reason=%s path=%s retry_in=%.1fs local_fallback=enabled error=%s",
+            "rate_limiter_unavailable reason=%s path=%s redis=%s retry_in=%.1fs local_fallback=enabled error_type=%s error=%s",
             reason,
             request_path,
+            _redis_endpoint_for_logs(REDIS_URL) if REDIS_URL else "-",
             RATE_LIMITER_RETRY_SECONDS,
+            error.__class__.__name__,
             str(error),
         )
 
@@ -372,22 +443,85 @@ async def _initialize_rate_limiter(force: bool = False) -> bool:
         if not force and now < rate_limiter_next_retry_at:
             return False
 
+        client: Optional[redis.Redis] = None
         try:
             client = _build_redis_client(REDIS_URL)
-            await client.ping()
-            await FastAPILimiter.init(
-                client,
-                identifier=rate_limit_identifier,
-                http_callback=rate_limit_callback,
+            await asyncio.wait_for(client.ping(), timeout=REDIS_INIT_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                FastAPILimiter.init(
+                    client,
+                    identifier=rate_limit_identifier,
+                    http_callback=rate_limit_callback,
+                ),
+                timeout=REDIS_INIT_TIMEOUT_SECONDS,
             )
             rate_limiter_client = client
             rate_limiter_ready = True
             rate_limiter_next_retry_at = 0.0
-            logger.info("rate_limiter_initialized")
+            logger.info(
+                "rate_limiter_initialized redis=%s",
+                _redis_endpoint_for_logs(REDIS_URL),
+            )
             return True
         except Exception as exc:
+            await _close_redis_client_instance(client, reason="init_failed")
             await _mark_rate_limiter_unavailable("init_failed", exc)
             return False
+
+
+async def _rate_limiter_retry_loop() -> None:
+    global rate_limiter_retry_stop_event
+    if rate_limiter_retry_stop_event is None:
+        rate_limiter_retry_stop_event = asyncio.Event()
+
+    logger.info(
+        "rate_limiter_retry_loop_started interval_seconds=%.1f",
+        RATE_LIMITER_RETRY_LOOP_SECONDS,
+    )
+
+    while not rate_limiter_retry_stop_event.is_set():
+        if ENABLE_RATE_LIMITING and not rate_limiter_ready:
+            await _initialize_rate_limiter()
+
+        try:
+            await asyncio.wait_for(
+                rate_limiter_retry_stop_event.wait(),
+                timeout=RATE_LIMITER_RETRY_LOOP_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            continue
+
+    logger.info("rate_limiter_retry_loop_stopped")
+
+
+def _start_rate_limiter_retry_loop() -> None:
+    global rate_limiter_retry_task, rate_limiter_retry_stop_event
+    if not ENABLE_RATE_LIMITING:
+        return
+
+    if rate_limiter_retry_stop_event is None:
+        rate_limiter_retry_stop_event = asyncio.Event()
+
+    if rate_limiter_retry_task and not rate_limiter_retry_task.done():
+        return
+
+    rate_limiter_retry_task = asyncio.create_task(_rate_limiter_retry_loop())
+
+
+async def _stop_rate_limiter_retry_loop() -> None:
+    global rate_limiter_retry_task, rate_limiter_retry_stop_event
+
+    if rate_limiter_retry_stop_event is not None:
+        rate_limiter_retry_stop_event.set()
+
+    if rate_limiter_retry_task is not None:
+        try:
+            await rate_limiter_retry_task
+        except Exception:
+            logger.exception("rate_limiter_retry_loop_failed")
+
+    rate_limiter_retry_task = None
+    rate_limiter_retry_stop_event = None
 
 
 class CircuitBreaker:
@@ -421,6 +555,28 @@ async def lifespan(app: FastAPI):
         if ENVIRONMENT == "production":
             raise RuntimeError("Missing REDIS_URL. Set it to enable shared rate limiting.")
         logger.warning("REDIS_URL missing, rate limiting disabled in development.")
+    else:
+        try:
+            normalized_redis_url = _normalize_redis_url(REDIS_URL)
+            redis_scheme = urlparse(normalized_redis_url).scheme.lower()
+            logger.info(
+                "rate_limiter_config redis=%s scheme=%s init_timeout=%.1fs retry_loop=%.1fs fail_closed=%s",
+                _redis_endpoint_for_logs(normalized_redis_url),
+                redis_scheme,
+                REDIS_INIT_TIMEOUT_SECONDS,
+                RATE_LIMITER_RETRY_LOOP_SECONDS,
+                RATE_LIMITER_FAIL_CLOSED,
+            )
+            if ENVIRONMENT == "production" and redis_scheme == "redis":
+                logger.warning(
+                    "rate_limiter_non_tls_scheme redis=%s. If Railway requires TLS for this endpoint, switch REDIS_URL to rediss://",
+                    _redis_endpoint_for_logs(normalized_redis_url),
+                )
+        except Exception as exc:
+            message = f"Invalid REDIS_URL configuration: {exc}"
+            if ENVIRONMENT == "production":
+                raise RuntimeError(message) from exc
+            logger.error(message)
 
     if ENVIRONMENT == "production" and not SUPABASE_URL:
         raise RuntimeError("Missing SUPABASE_URL. Set it to verify Supabase access tokens.")
@@ -428,16 +584,36 @@ async def lifespan(app: FastAPI):
         logger.warning("SUPABASE_URL missing; using legacy AUTH_SECRET bearer verification.")
 
     if ENABLE_RATE_LIMITING:
-        initialized = await _initialize_rate_limiter(force=True)
-        if not initialized and ENVIRONMENT == "production":
-            logger.error(
-                "rate_limiter_startup_failed: API is running fail-open and will retry Redis initialization."
+        _start_rate_limiter_retry_loop()
+        init_task = asyncio.create_task(_initialize_rate_limiter(force=True))
+        initialized = False
+        try:
+            initialized = await asyncio.wait_for(
+                asyncio.shield(init_task),
+                timeout=RATE_LIMITER_STARTUP_WAIT_SECONDS,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "rate_limiter_startup_probe_timeout wait_seconds=%.2f. Startup continues with local fallback until Redis reconnects.",
+                RATE_LIMITER_STARTUP_WAIT_SECONDS,
+            )
+        except Exception as exc:
+            await _mark_rate_limiter_unavailable("startup_probe_failed", exc)
+
+        if not initialized:
+            message = (
+                "rate_limiter_startup_degraded: Redis not ready. "
+                "Requests use local fallback and background retries remain active."
+            )
+            if ENVIRONMENT == "production" and RATE_LIMITER_FAIL_CLOSED:
+                raise RuntimeError(message)
+            logger.error(message)
 
     init_db()
     try:
         yield
     finally:
+        await _stop_rate_limiter_retry_loop()
         await _close_rate_limiter_client()
 
 def _noop_limiter():
@@ -704,7 +880,15 @@ def root():
 
 @app.get("/health", dependencies=[limiter_dep(LIMITS_READ)])
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "rate_limiter": {
+            "enabled": ENABLE_RATE_LIMITING,
+            "ready": rate_limiter_ready,
+            "degraded": bool(ENABLE_RATE_LIMITING and not rate_limiter_ready),
+            "redis": _redis_endpoint_for_logs(REDIS_URL) if REDIS_URL else None,
+        },
+    }
 
 
 @app.get("/markets", response_model=List[Market], dependencies=[limiter_dep(LIMITS_READ)])
