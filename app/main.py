@@ -55,7 +55,15 @@ SUPABASE_JWKS_CACHE_TTL_SECONDS = int(os.getenv("SUPABASE_JWKS_CACHE_TTL_SECONDS
 SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS = float(os.getenv("SUPABASE_JWKS_REQUEST_TIMEOUT_SECONDS", "3"))
 ENVIRONMENT = (os.getenv("ENVIRONMENT") or "development").lower()
 REDIS_URL = os.getenv("REDIS_URL")
-ENABLE_RATE_LIMITING = bool(REDIS_URL)
+REDIS_PRIVATE_URL = os.getenv("REDIS_PRIVATE_URL")
+REDIS_PUBLIC_URL = os.getenv("REDIS_PUBLIC_URL")
+REDIS_URL_FALLBACKS = os.getenv("REDIS_URL_FALLBACKS", "")
+ENABLE_RATE_LIMITING = bool(
+    REDIS_URL
+    or REDIS_PRIVATE_URL
+    or REDIS_PUBLIC_URL
+    or REDIS_URL_FALLBACKS.strip()
+)
 REDIS_CONNECT_TIMEOUT_SECONDS = float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.5"))
 REDIS_SOCKET_TIMEOUT_SECONDS = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "1.5"))
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
@@ -280,9 +288,24 @@ def _redis_endpoint_for_logs(redis_url: str) -> str:
 def _rate_limiter_log_url() -> str:
     if rate_limiter_active_url:
         return _redis_endpoint_for_logs(rate_limiter_active_url)
-    if REDIS_URL:
-        return _redis_endpoint_for_logs(REDIS_URL)
+    primary = _primary_redis_url()
+    if primary:
+        return _redis_endpoint_for_logs(primary)
     return "-"
+
+
+def _primary_redis_url() -> Optional[str]:
+    for item in (REDIS_URL, REDIS_PRIVATE_URL, REDIS_PUBLIC_URL):
+        if item and item.strip():
+            return item.strip()
+
+    if REDIS_URL_FALLBACKS:
+        for value in REDIS_URL_FALLBACKS.split(","):
+            cleaned = value.strip()
+            if cleaned:
+                return cleaned
+
+    return None
 
 
 def _validate_redis_ssl_cert_reqs_value() -> None:
@@ -341,23 +364,49 @@ def _normalize_redis_url(redis_url: str) -> str:
     return urlunparse(parsed)
 
 
-def _redis_candidate_urls(redis_url: str) -> list[str]:
+def _configured_redis_urls(primary_url: str) -> list[str]:
+    urls: list[str] = [primary_url]
+    for candidate in (REDIS_URL, REDIS_PRIVATE_URL, REDIS_PUBLIC_URL):
+        if candidate:
+            urls.append(candidate)
+
+    if REDIS_URL_FALLBACKS:
+        for item in REDIS_URL_FALLBACKS.split(","):
+            value = item.strip()
+            if value:
+                urls.append(value)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in urls:
+        cleaned = item.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        deduped.append(cleaned)
+        seen.add(cleaned)
+    return deduped
+
+
+def _redis_scheme_candidates(redis_url: str) -> list[str]:
     normalized = _normalize_redis_url(redis_url)
     parsed = urlparse(normalized)
     scheme = parsed.scheme.lower()
 
     candidates = [normalized]
-    if not REDIS_TRY_TLS_FALLBACK:
-        return candidates
-
-    if scheme == "redis":
+    if REDIS_TRY_TLS_FALLBACK and scheme == "redis":
         candidates.append(urlunparse(parsed._replace(scheme="rediss")))
-    elif scheme == "rediss" and not REDIS_FORCE_TLS:
+    elif REDIS_TRY_TLS_FALLBACK and scheme == "rediss" and not REDIS_FORCE_TLS:
         candidates.append(urlunparse(parsed._replace(scheme="redis")))
+    return candidates
 
-    # Deduplicate while preserving order.
+
+def _redis_candidate_urls(redis_url: str) -> list[str]:
+    candidates: list[str] = []
+    for configured in _configured_redis_urls(redis_url):
+        candidates.extend(_redis_scheme_candidates(configured))
+
     deduped: list[str] = []
-    seen = set()
+    seen: set[str] = set()
     for item in candidates:
         if item in seen:
             continue
@@ -483,7 +532,8 @@ async def _mark_rate_limiter_unavailable(
 async def _initialize_rate_limiter(force: bool = False) -> bool:
     global rate_limiter_active_url, rate_limiter_ready, rate_limiter_next_retry_at, rate_limiter_init_lock, rate_limiter_client
 
-    if not ENABLE_RATE_LIMITING or not REDIS_URL:
+    primary_redis_url = _primary_redis_url()
+    if not ENABLE_RATE_LIMITING or not primary_redis_url:
         return False
 
     if rate_limiter_ready:
@@ -504,7 +554,7 @@ async def _initialize_rate_limiter(force: bool = False) -> bool:
             return False
 
         last_error: Optional[Exception] = None
-        for candidate_url in _redis_candidate_urls(REDIS_URL):
+        for candidate_url in _redis_candidate_urls(primary_redis_url):
             client: Optional[redis.Redis] = None
             try:
                 client = _build_redis_client(candidate_url)
@@ -623,14 +673,18 @@ odds_breaker = CircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not REDIS_URL:
+    primary_redis_url = _primary_redis_url()
+    if not primary_redis_url:
         if ENVIRONMENT == "production":
-            raise RuntimeError("Missing REDIS_URL. Set it to enable shared rate limiting.")
-        logger.warning("REDIS_URL missing, rate limiting disabled in development.")
+            raise RuntimeError(
+                "Missing Redis configuration. Set REDIS_URL (or REDIS_PRIVATE_URL / REDIS_PUBLIC_URL)."
+            )
+        logger.warning("Redis URL missing, rate limiting disabled in development.")
     else:
         try:
-            normalized_redis_url = _normalize_redis_url(REDIS_URL)
+            normalized_redis_url = _normalize_redis_url(primary_redis_url)
             redis_scheme = urlparse(normalized_redis_url).scheme.lower()
+            candidate_urls = _redis_candidate_urls(primary_redis_url)
             logger.info(
                 "rate_limiter_config redis=%s scheme=%s init_timeout=%.1fs retry_loop=%.1fs fail_closed=%s",
                 _redis_endpoint_for_logs(normalized_redis_url),
@@ -639,13 +693,18 @@ async def lifespan(app: FastAPI):
                 RATE_LIMITER_RETRY_LOOP_SECONDS,
                 RATE_LIMITER_FAIL_CLOSED,
             )
+            logger.info(
+                "rate_limiter_candidates count=%d endpoints=%s",
+                len(candidate_urls),
+                ",".join(_redis_endpoint_for_logs(url) for url in candidate_urls),
+            )
             if ENVIRONMENT == "production" and redis_scheme == "redis":
                 logger.warning(
                     "rate_limiter_non_tls_scheme redis=%s. If Railway requires TLS for this endpoint, switch REDIS_URL to rediss://",
                     _redis_endpoint_for_logs(normalized_redis_url),
                 )
         except Exception as exc:
-            message = f"Invalid REDIS_URL configuration: {exc}"
+            message = f"Invalid Redis URL configuration: {exc}"
             if ENVIRONMENT == "production":
                 raise RuntimeError(message) from exc
             logger.error(message)
@@ -958,7 +1017,7 @@ def health():
             "enabled": ENABLE_RATE_LIMITING,
             "ready": rate_limiter_ready,
             "degraded": bool(ENABLE_RATE_LIMITING and not rate_limiter_ready),
-            "redis": _rate_limiter_log_url() if REDIS_URL else None,
+            "redis": _rate_limiter_log_url() if _primary_redis_url() else None,
         },
     }
 
