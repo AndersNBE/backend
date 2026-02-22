@@ -86,18 +86,36 @@ def _rules_payload(title: str) -> dict:
 
 def main() -> None:
     environment = (os.getenv("ENVIRONMENT") or "development").lower()
+    is_production = environment == "production"
     allow_production = os.getenv("ALLOW_PRODUCTION_SEED", "false").lower() == "true"
-    if environment == "production" and not allow_production:
+    allow_full_production_seed = os.getenv("ALLOW_PRODUCTION_FULL_SEED", "false").lower() == "true"
+    seed_limit_raw = os.getenv("SEED_MARKET_LIMIT")
+
+    if is_production and not allow_production:
         raise RuntimeError(
             "Seeding is blocked in production. Set ALLOW_PRODUCTION_SEED=true to override intentionally."
         )
+
+    seed_markets = SEED_MARKETS
+    if is_production and not allow_full_production_seed:
+        # Default production safety rail: seed only two markets unless explicitly overridden.
+        seed_markets = SEED_MARKETS[:2]
+
+    if seed_limit_raw:
+        try:
+            seed_limit = int(seed_limit_raw)
+        except ValueError as exc:
+            raise RuntimeError("SEED_MARKET_LIMIT must be a positive integer") from exc
+        if seed_limit <= 0:
+            raise RuntimeError("SEED_MARKET_LIMIT must be a positive integer")
+        seed_markets = seed_markets[:seed_limit]
 
     db = SessionLocal()
     now = datetime.now(timezone.utc)
     created = 0
     updated = 0
     try:
-        for index, item in enumerate(SEED_MARKETS):
+        for index, item in enumerate(seed_markets):
             open_time = now + timedelta(hours=index)
             close_time = now + timedelta(days=21 + index)
             resolve_time = close_time + timedelta(hours=6)
@@ -185,7 +203,7 @@ def main() -> None:
             )
 
         db.commit()
-        print(f"seed completed created={created} updated={updated}")
+        print(f"seed completed created={created} updated={updated} total={len(seed_markets)}")
     finally:
         db.close()
 

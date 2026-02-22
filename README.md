@@ -104,6 +104,12 @@ By default, seeding is blocked in production. To override intentionally:
 ALLOW_PRODUCTION_SEED=true python -m app.scripts.seed_trading_markets
 ```
 
+Production safety behavior:
+
+- If `ENVIRONMENT=production` and `ALLOW_PRODUCTION_SEED=true`, the script seeds only the first 2 markets by default.
+- To seed the full set in production, also set `ALLOW_PRODUCTION_FULL_SEED=true`.
+- Optional: `SEED_MARKET_LIMIT=<N>` to cap how many markets are seeded in any environment.
+
 ## CI runtime check
 
 ```bash
