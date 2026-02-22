@@ -223,6 +223,25 @@ def sign_user_id(user_id: str) -> str:
     return f"{user_id}:{signature}"
 
 
+def _require_legacy_auth_secret() -> None:
+    if not AUTH_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Legacy auth endpoints are disabled.",
+        )
+
+
+def _issue_legacy_access_token(user_id: str) -> str:
+    try:
+        return sign_user_id(user_id)
+    except RuntimeError as exc:
+        logger.error("legacy_auth_token_unavailable reason=missing_auth_secret")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Legacy auth endpoints are disabled.",
+        ) from exc
+
+
 def hash_payload(payload: dict) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -956,6 +975,15 @@ TRADING_TO_LEGACY_STATUS: dict[str, Status] = {
     TradingMarketStatus.cancelled.value: "closed",
 }
 
+PUBLIC_TRADING_STATUSES = (
+    TradingMarketStatus.live,
+    TradingMarketStatus.trading_paused,
+    TradingMarketStatus.closed,
+    TradingMarketStatus.resolving,
+    TradingMarketStatus.settled,
+    TradingMarketStatus.cancelled,
+)
+
 
 def _enum_value(raw: object) -> str:
     value = getattr(raw, "value", None)
@@ -993,7 +1021,10 @@ def to_market_response(market: TradingMarket) -> Market:
 def fetch_market_by_slug(db: Session, market_slug: str) -> Optional[TradingMarket]:
     return (
         db.query(TradingMarket)
-        .filter(TradingMarket.slug == market_slug)
+        .filter(
+            TradingMarket.slug == market_slug,
+            TradingMarket.status.in_(PUBLIC_TRADING_STATUSES),
+        )
         .one_or_none()
     )
 
@@ -1027,6 +1058,7 @@ def list_markets(request: Request, db: Session = Depends(get_db)):
     started_at = time.monotonic()
     rows = (
         db.query(TradingMarket)
+        .filter(TradingMarket.status.in_(PUBLIC_TRADING_STATUSES))
         .order_by(TradingMarket.created_at.desc())
         .all()
     )
@@ -1050,12 +1082,13 @@ def get_market(market_id: str, db: Session = Depends(get_db)):
 
 @app.post("/auth/login", dependencies=[limiter_dep(LIMITS_AUTH)])
 def login(payload: LoginRequest):
+    _require_legacy_auth_secret()
     if not payload.email or not payload.password:
         raise HTTPException(status_code=400, detail="Invalid credentials")
     user_id = "demo-user"
     return {
         "user_id": user_id,
-        "access_token": sign_user_id(user_id),
+        "access_token": _issue_legacy_access_token(user_id),
         "token_type": "bearer",
         "redirect": "/markets",
     }
@@ -1063,12 +1096,13 @@ def login(payload: LoginRequest):
 
 @app.post("/auth/signup", dependencies=[limiter_dep(LIMITS_AUTH)])
 def signup(payload: SignupRequest):
+    _require_legacy_auth_secret()
     if not payload.email or not payload.password:
         raise HTTPException(status_code=400, detail="Invalid signup data")
     user_id = "demo-user"
     return {
         "user_id": user_id,
-        "access_token": sign_user_id(user_id),
+        "access_token": _issue_legacy_access_token(user_id),
         "token_type": "bearer",
         "redirect": "/signin",
     }

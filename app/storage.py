@@ -17,7 +17,7 @@ from sqlalchemy import (
     create_engine,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -179,6 +179,9 @@ class TradingMarket(TradingBase):
     trading_starts_at = Column(DateTime(timezone=True), nullable=True)
     trading_ends_at = Column(DateTime(timezone=True), nullable=False)
     resolves_after = Column(DateTime(timezone=True), nullable=False)
+    open_time = Column(DateTime(timezone=True), nullable=False)
+    close_time = Column(DateTime(timezone=True), nullable=False)
+    resolve_time = Column(DateTime(timezone=True), nullable=True)
     settled_outcome = Column(String(16), nullable=True)
     settled_at = Column(DateTime(timezone=True), nullable=True)
     created_by = Column(UUID(as_uuid=True), nullable=True)
@@ -201,7 +204,42 @@ class TradingMarketRule(TradingBase):
     cutoff_at = Column(DateTime(timezone=True), nullable=True)
     dispute_window_seconds = Column(Integer, nullable=False, default=0, server_default=text("0"))
     is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    rules_json = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     created_by = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+
+class TradingMarketStateEvent(TradingBase):
+    __tablename__ = "market_state_events"
+    __table_args__ = {"schema": "trading"}
+
+    id = Column(BigInteger, primary_key=True)
+    public_id = Column(UUID(as_uuid=True), unique=True, nullable=False, default=uuid.uuid4)
+    market_id = Column(BigInteger, nullable=False)
+    from_status = Column(
+        Enum(
+            TradingMarketStatus,
+            name="market_status",
+            schema="trading",
+            native_enum=True,
+            create_type=False,
+        ),
+        nullable=True,
+    )
+    to_status = Column(
+        Enum(
+            TradingMarketStatus,
+            name="market_status",
+            schema="trading",
+            native_enum=True,
+            create_type=False,
+        ),
+        nullable=False,
+    )
+    reason = Column(Text, nullable=True)
+    event_metadata = Column("metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    changed_by = Column(UUID(as_uuid=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
 
